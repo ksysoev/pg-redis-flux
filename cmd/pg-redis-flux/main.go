@@ -12,9 +12,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-func main() {
-	const outputPlugin = "pgoutput"
+const (
+	outputPlugin = "pgoutput"
+	msgTimeout   = 10 * time.Second
+)
 
+func main() {
 	ctx := context.Background()
 
 	conn, err := pgconn.Connect(ctx, os.Getenv("PGLOGREPL_DEMO_CONN_STRING"))
@@ -25,16 +28,22 @@ func main() {
 	defer conn.Close(ctx)
 
 	result := conn.Exec(ctx, "DROP PUBLICATION IF EXISTS pglogrepl_demo;")
+
 	_, err = result.ReadAll()
 	if err != nil {
-		log.Fatalln("drop publication if exists error", err)
+		log.Println("drop publication if exists error", err)
+		return
 	}
 
 	result = conn.Exec(ctx, "CREATE PUBLICATION pglogrepl_demo FOR ALL TABLES;")
+
 	_, err = result.ReadAll()
 	if err != nil {
-		log.Fatalln("create publication error", err)
+		log.Println("create publication error", err)
+
+		return
 	}
+
 	log.Println("create publication pglogrepl_demo")
 
 	pluginArguments := []string{
@@ -46,27 +55,32 @@ func main() {
 
 	sysident, err := pglogrepl.IdentifySystem(ctx, conn)
 	if err != nil {
-		log.Fatalln("IdentifySystem failed:", err)
+		log.Println("IdentifySystem failed:", err)
+		return
 	}
+
 	log.Println("SystemID:", sysident.SystemID, "Timeline:", sysident.Timeline, "XLogPos:", sysident.XLogPos, "DBName:", sysident.DBName)
 
 	slotName := "pglogrepl_demo"
 
 	_, err = pglogrepl.CreateReplicationSlot(ctx, conn, slotName, outputPlugin, pglogrepl.CreateReplicationSlotOptions{Temporary: true})
 	if err != nil {
-		log.Fatalln("CreateReplicationSlot failed:", err)
+		log.Println("CreateReplicationSlot failed:", err)
+		return
 	}
+
 	log.Println("Created temporary replication slot:", slotName)
 
 	err = pglogrepl.StartReplication(ctx, conn, slotName, sysident.XLogPos, pglogrepl.StartReplicationOptions{PluginArgs: pluginArguments})
 	if err != nil {
-		log.Fatalln("StartReplication failed:", err)
+		log.Println("StartReplication failed:", err)
+		return
 	}
+
 	log.Println("Logical replication started on slot", slotName)
 
 	clientXLogPos := sysident.XLogPos
-	standbyMessageTimeout := time.Second * 10
-	nextStandbyMessageDeadline := time.Now().Add(standbyMessageTimeout)
+	nextStandbyMessageDeadline := time.Now().Add(msgTimeout)
 	relationsV2 := map[uint32]*pglogrepl.RelationMessageV2{}
 	typeMap := pgtype.NewMap()
 
@@ -76,29 +90,40 @@ func main() {
 		if time.Now().After(nextStandbyMessageDeadline) {
 			err = pglogrepl.SendStandbyStatusUpdate(ctx, conn, pglogrepl.StandbyStatusUpdate{WALWritePosition: clientXLogPos})
 			if err != nil {
-				log.Fatalln("SendStandbyStatusUpdate failed:", err)
+				log.Println("SendStandbyStatusUpdate failed:", err)
+				return
 			}
+
 			log.Printf("Sent Standby status message at %s\n", clientXLogPos.String())
-			nextStandbyMessageDeadline = time.Now().Add(standbyMessageTimeout)
+
+			nextStandbyMessageDeadline = time.Now().Add(msgTimeout)
 		}
 
 		ctx, cancel := context.WithDeadline(ctx, nextStandbyMessageDeadline)
 		rawMsg, err := conn.ReceiveMessage(ctx)
+
 		cancel()
+
 		if err != nil {
 			if pgconn.Timeout(err) {
 				continue
 			}
-			log.Fatalln("ReceiveMessage failed:", err)
+
+			log.Println("ReceiveMessage failed:", err)
+
+			return
 		}
 
 		if errMsg, ok := rawMsg.(*pgproto3.ErrorResponse); ok {
-			log.Fatalf("received Postgres WAL error: %+v", errMsg)
+			log.Printf("received Postgres WAL error: %+v\n", errMsg)
+
+			return
 		}
 
 		msg, ok := rawMsg.(*pgproto3.CopyData)
 		if !ok {
 			log.Printf("Received unexpected message: %T\n", rawMsg)
+
 			continue
 		}
 
@@ -106,12 +131,16 @@ func main() {
 		case pglogrepl.PrimaryKeepaliveMessageByteID:
 			pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
 			if err != nil {
-				log.Fatalln("ParsePrimaryKeepaliveMessage failed:", err)
+				log.Println("ParsePrimaryKeepaliveMessage failed:", err)
+				return
 			}
+
 			log.Println("Primary Keepalive Message =>", "ServerWALEnd:", pkm.ServerWALEnd, "ServerTime:", pkm.ServerTime, "ReplyRequested:", pkm.ReplyRequested)
+
 			if pkm.ServerWALEnd > clientXLogPos {
 				clientXLogPos = pkm.ServerWALEnd
 			}
+
 			if pkm.ReplyRequested {
 				nextStandbyMessageDeadline = time.Time{}
 			}
@@ -119,7 +148,8 @@ func main() {
 		case pglogrepl.XLogDataByteID:
 			xld, err := pglogrepl.ParseXLogData(msg.Data[1:])
 			if err != nil {
-				log.Fatalln("ParseXLogData failed:", err)
+				log.Println("ParseXLogData failed:", err)
+				return
 			}
 
 			log.Printf("XLogData => WALStart %s ServerWALEnd %s ServerTime %s WALData:\n", xld.WALStart, xld.ServerWALEnd, xld.ServerTime)
@@ -138,7 +168,9 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 	if err != nil {
 		log.Fatalf("Parse logical replication message: %s", err)
 	}
+
 	log.Printf("Receive a logical replication message: %s", logicalMsg.Type())
+
 	switch logicalMsg := logicalMsg.(type) {
 	case *pglogrepl.RelationMessageV2:
 		relations[logicalMsg.RelationID] = logicalMsg
@@ -153,22 +185,27 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 		if !ok {
 			log.Fatalf("unknown relation ID %d", logicalMsg.RelationID)
 		}
+
 		values := map[string]interface{}{}
+
 		for idx, col := range logicalMsg.Tuple.Columns {
 			colName := rel.Columns[idx].Name
+
 			switch col.DataType {
 			case 'n': // null
 				values[colName] = nil
 			case 'u': // unchanged toast
 				// This TOAST value was not changed. TOAST values are not stored in the tuple, and logical replication doesn't want to spend a disk read to fetch its value for you.
-			case 't': //text
+			case 't': // text
 				val, err := decodeTextColumnData(typeMap, col.Data, rel.Columns[idx].DataType)
 				if err != nil {
 					log.Fatalln("error decoding column data:", err)
 				}
+
 				values[colName] = val
 			}
 		}
+
 		log.Printf("insert for xid %d\n", logicalMsg.Xid)
 		log.Printf("INSERT INTO %s.%s: %v", rel.Namespace, rel.RelationName, values)
 
@@ -190,9 +227,11 @@ func processV2(walData []byte, relations map[uint32]*pglogrepl.RelationMessageV2
 
 	case *pglogrepl.StreamStartMessageV2:
 		*inStream = true
+
 		log.Printf("Stream start message: xid %d, first segment? %d", logicalMsg.Xid, logicalMsg.FirstSegment)
 	case *pglogrepl.StreamStopMessageV2:
 		*inStream = false
+
 		log.Printf("Stream stop message")
 	case *pglogrepl.StreamCommitMessageV2:
 		log.Printf("Stream commit message: xid %d", logicalMsg.Xid)
@@ -207,5 +246,6 @@ func decodeTextColumnData(mi *pgtype.Map, data []byte, dataType uint32) (interfa
 	if dt, ok := mi.TypeForOID(dataType); ok {
 		return dt.Codec.DecodeValue(mi, dataType, pgtype.TextFormatCode, data)
 	}
+
 	return string(data), nil
 }
